@@ -64,6 +64,29 @@ void I2SAudioSpeaker::setup() {
     this->mark_failed();
     return;
   }
+
+  if (this->keep_alive_) {
+    // Pre-warm the I2S channel at boot time so the initial pop/click happens during startup
+    // instead of on the first audio event. The channel is initialized, briefly enabled (causing
+    // the transient), then disabled and left allocated for the keep-alive reuse path.
+    esp_err_t err = this->start_i2s_driver_(this->audio_stream_info_);
+    if (err == ESP_OK) {
+      // Channel is now enabled from start_i2s_driver_. Disable it and remove callback,
+      // leaving it allocated and configured for keep-alive reuse.
+      i2s_channel_disable(this->tx_handle_);
+      const i2s_event_callbacks_t callbacks = {
+          .on_sent = nullptr,
+      };
+      i2s_channel_register_event_callback(this->tx_handle_, &callbacks, this);
+      if (this->i2s_event_queue_ != nullptr) {
+        xQueueReset(this->i2s_event_queue_);
+      }
+      this->parent_->unlock();
+      ESP_LOGI(TAG, "Keep-alive: I2S channel pre-warmed at boot");
+    } else {
+      ESP_LOGW(TAG, "Keep-alive: failed to pre-warm I2S channel, will init on first use");
+    }
+  }
 }
 
 void I2SAudioSpeaker::dump_config() {
@@ -75,6 +98,7 @@ void I2SAudioSpeaker::dump_config() {
   if (this->timeout_.has_value()) {
     ESP_LOGCONFIG(TAG, "  Timeout: %" PRIu32 " ms", this->timeout_.value());
   }
+  ESP_LOGCONFIG(TAG, "  Keep alive: %s", this->keep_alive_ ? "YES" : "NO");
   ESP_LOGCONFIG(TAG, "  Communication format: %s", this->i2s_comm_fmt_.c_str());
 }
 
@@ -107,7 +131,34 @@ void I2SAudioSpeaker::loop() {
     vTaskDelete(this->speaker_task_handle_);
     this->speaker_task_handle_ = nullptr;
 
-    this->stop_i2s_driver_();
+    if (this->keep_alive_) {
+      // Keep-alive mode: disable the I2S channel but don't delete it.
+      // This stops the DMA and clocks cleanly, but the channel remains allocated
+      // and configured. On next start, we just re-enable it — no full teardown/rebuild
+      // of the I2S peripheral, which avoids the pop/click caused by GPIO reconfiguration.
+
+      // Must disable channel BEFORE modifying callbacks (ESP-IDF requirement)
+      i2s_channel_disable(this->tx_handle_);
+
+      // Disable the on_sent callback to prevent stale events
+      const i2s_event_callbacks_t callbacks = {
+          .on_sent = nullptr,
+      };
+      i2s_channel_register_event_callback(this->tx_handle_, &callbacks, this);
+
+      // Drain stale events
+      if (this->i2s_event_queue_ != nullptr) {
+        xQueueReset(this->i2s_event_queue_);
+      }
+
+      // Unlock the parent I2S bus so the next start cycle can re-acquire it
+      this->parent_->unlock();
+
+      // Don't delete channel — it stays allocated with all config intact
+      ESP_LOGD(TAG, "Keep-alive: I2S channel disabled but kept allocated");
+    } else {
+      this->stop_i2s_driver_();
+    }
     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::ALL_BITS);
     this->status_clear_error();
 
@@ -133,10 +184,32 @@ void I2SAudioSpeaker::loop() {
         break;
       }
 
-      if (this->start_i2s_driver_(this->audio_stream_info_) != ESP_OK) {
-        ESP_LOGE(TAG, "Driver failed to start; retrying in 1 second");
-        this->status_momentary_error("driver-faiure", 1000);
-        break;
+      if (this->keep_alive_ && this->tx_handle_ != nullptr && this->audio_stream_info_ == this->current_stream_info_) {
+        // Keep-alive mode: I2S channel is already allocated and configured from previous session
+        // and the stream settings are unchanged. Re-acquire the bus lock, clear stale events,
+        // and re-enable the channel.
+        if (!this->parent_->try_lock()) {
+          ESP_LOGE(TAG, "Keep-alive: parent I2S bus not free");
+          this->status_momentary_error("driver-failure", 1000);
+          break;
+        }
+        if (this->i2s_event_queue_ != nullptr) {
+          xQueueReset(this->i2s_event_queue_);
+        }
+        i2s_channel_enable(this->tx_handle_);
+        ESP_LOGD(TAG, "Keep-alive: re-enabled existing I2S channel");
+      } else {
+        // Full init path: either keep_alive is false, no channel is allocated yet, or the
+        // stream settings changed and we need to reconfigure the driver.
+        if (this->keep_alive_ && this->tx_handle_ != nullptr) {
+          // Stream info changed — tear down the existing channel before reinitialising.
+          this->stop_i2s_driver_();
+        }
+        if (this->start_i2s_driver_(this->audio_stream_info_) != ESP_OK) {
+          ESP_LOGE(TAG, "Driver failed to start; retrying in 1 second");
+          this->status_momentary_error("driver-failure", 1000);
+          break;
+        }
       }
 
       if (this->speaker_task_handle_ == nullptr) {
@@ -146,7 +219,16 @@ void I2SAudioSpeaker::loop() {
         if (this->speaker_task_handle_ == nullptr) {
           ESP_LOGE(TAG, "Task failed to start, retrying in 1 second");
           this->status_momentary_error("task-failure", 1000);
-          this->stop_i2s_driver_();  // Stops the driver to return the lock; will be reloaded in next attempt
+          if (this->keep_alive_) {
+            // Keep-alive path: bus was locked via try_lock() or start_i2s_driver_(), but no
+            // task was created to release it via TASK_STOPPED. Release the lock manually.
+            if (this->tx_handle_ != nullptr) {
+              i2s_channel_disable(this->tx_handle_);
+            }
+            this->parent_->unlock();
+          } else {
+            this->stop_i2s_driver_();  // Stops the driver to return the lock; will be reloaded in next attempt
+          }
         }
       }
       break;
@@ -272,6 +354,9 @@ void I2SAudioSpeaker::speaker_task(void *params) {
 
     xEventGroupSetBits(this_speaker->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
 
+    // Original unmodified task loop — let it run and stop normally.
+    // The keep-alive magic happens in loop() where we skip stop_i2s_driver_()
+    // and in STATE_STARTING where we reuse the existing I2S driver.
     while (this_speaker->pause_state_ || !this_speaker->timeout_.has_value() ||
            (millis() - last_data_received_time) <= this_speaker->timeout_.value()) {
       uint32_t event_group_bits = xEventGroupGetBits(this_speaker->event_group_);

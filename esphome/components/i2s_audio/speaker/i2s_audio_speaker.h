@@ -29,6 +29,7 @@ class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Comp
 
   void set_buffer_duration(uint32_t buffer_duration_ms) { this->buffer_duration_ms_ = buffer_duration_ms; }
   void set_timeout(uint32_t ms) { this->timeout_ = ms; }
+  void set_keep_alive(bool keep_alive) { this->keep_alive_ = keep_alive; }
   void set_dout_pin(uint8_t pin) { this->dout_pin_ = (gpio_num_t) pin; }
   void set_i2s_comm_fmt(std::string mode) { this->i2s_comm_fmt_ = std::move(mode); }
 
@@ -108,6 +109,7 @@ class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Comp
 
   optional<uint32_t> timeout_;
 
+  bool keep_alive_{false};
   bool pause_state_{false};
 
   int16_t q15_volume_factor_{INT16_MAX};
@@ -116,7 +118,7 @@ class I2SAudioSpeaker : public I2SAudioOut, public speaker::Speaker, public Comp
 
   gpio_num_t dout_pin_;
   std::string i2s_comm_fmt_;
-  i2s_chan_handle_t tx_handle_;
+  i2s_chan_handle_t tx_handle_{nullptr};
 };
 
 }  // namespace i2s_audio
