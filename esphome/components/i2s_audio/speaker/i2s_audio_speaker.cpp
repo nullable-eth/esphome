@@ -12,9 +12,7 @@
 #include "esphome/core/log.h"
 
 #include "esp_timer.h"
-
-// esp-audio-libs
-#include <gain.h>
+#include <cmath>
 
 namespace esphome::i2s_audio {
 
@@ -236,7 +234,8 @@ void I2SAudioSpeakerBase::set_volume(float volume) {
       this->q31_volume_factor_ = 0;
     } else {
       this->q31_volume_factor_ =
-          esp_audio_libs::gain::db_to_q31(remap<float, float>(volume, 0.0f, 1.0f, SOFTWARE_VOLUME_MIN_DB, 0.0f));
+          (int32_t) (powf(10.0f, remap<float, float>(volume, 0.0f, 1.0f, SOFTWARE_VOLUME_MIN_DB, 0.0f) / 20.0f) *
+                     INT32_MAX);
     }
   }
 }
@@ -398,7 +397,12 @@ void I2SAudioSpeakerBase::apply_software_volume_(uint8_t *data, size_t bytes_rea
   const size_t bytes_per_sample = this->current_stream_info_.samples_to_bytes(1);
   const uint32_t len = bytes_read / bytes_per_sample;
 
-  esp_audio_libs::gain::apply(data, data, this->q31_volume_factor_, len, bytes_per_sample);
+  for (uint32_t i = 0; i < len; ++i) {
+    int32_t sample = audio::unpack_audio_sample_to_q31(&data[i * bytes_per_sample], bytes_per_sample);
+    // Q31 multiply: (sample * factor) >> 31, but use int64 to avoid overflow
+    sample = (int32_t) (((int64_t) sample * (int64_t) this->q31_volume_factor_) >> 31);
+    audio::pack_q31_as_audio_sample(sample, &data[i * bytes_per_sample], bytes_per_sample);
+  }
 }
 
 void I2SAudioSpeakerBase::swap_esp32_mono_samples_(uint8_t *data, size_t bytes_read) {
