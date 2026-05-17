@@ -46,12 +46,25 @@ static const char *const VERSION_FMT = "%u.%02X.%02X%02X%02X%02X";
 // Helper function to format MAC address with stack allocation
 // Returns pointer to UNKNOWN_MAC constant or formatted buffer
 // Buffer must be exactly 18 bytes (17 for "XX:XX:XX:XX:XX:XX" + null terminator)
+//
+// NOTE: Does NOT use esphome::mac_address_is_valid() — as of ESPHome 2026.4.x
+// that helper rejects MACs with the multicast bit set in byte 0, which is too
+// strict for HLK radar Bluetooth MACs (e.g. F5:8E:0F:F5:EB:A7). Radar BT MACs
+// legitimately use locally-administered first bytes. We only reject all-zeros
+// and all-ones here; the NO_MAC sentinel filter is handled by the caller.
 inline const char *format_mac_str(const uint8_t *mac_address, std::span<char, 18> buffer) {
-  if (mac_address_is_valid(mac_address)) {
-    format_mac_addr_upper(mac_address, buffer.data());
-    return buffer.data();
+  bool all_zeros = true, all_ones = true;
+  for (uint8_t i = 0; i < 6; i++) {
+    if (mac_address[i] != 0x00)
+      all_zeros = false;
+    if (mac_address[i] != 0xFF)
+      all_ones = false;
   }
-  return UNKNOWN_MAC;
+  if (all_zeros || all_ones) {
+    return UNKNOWN_MAC;
+  }
+  format_mac_addr_upper(mac_address, buffer.data());
+  return buffer.data();
 }
 
 // Helper function to format firmware version with stack allocation
