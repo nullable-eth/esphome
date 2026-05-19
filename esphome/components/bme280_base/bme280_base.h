@@ -98,6 +98,7 @@ class BME280Component : public PollingComponent {
   BME280Oversampling pressure_oversampling_{BME280_OVERSAMPLING_16X};
   BME280Oversampling humidity_oversampling_{BME280_OVERSAMPLING_16X};
   BME280IIRFilter iir_filter_{BME280_IIR_FILTER_OFF};
+  bool has_humidity_{true};
   sensor::Sensor *temperature_sensor_{nullptr};
   sensor::Sensor *pressure_sensor_{nullptr};
   sensor::Sensor *humidity_sensor_{nullptr};
