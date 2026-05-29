@@ -37,6 +37,24 @@ void I2SAudioSpeakerBase::setup() {
   // Initialize volume control. When audio_dac is configured, this sets the DAC volume.
   // When no audio_dac is configured, this initializes software volume control.
   this->set_volume(this->volume_);
+
+  if (this->keep_alive_) {
+    // Boot-time analog-path settle: briefly run the I2S clocks with silence so the DAC's
+    // analog output stage transitions from its indeterminate post-init state to a known
+    // zero BEFORE the first real audio event. Without this, the first audio after boot
+    // (and any audio after a long enough idle gap for the analog stage to relax) produces
+    // an audible cold-start transient. Channel is fully torn down afterward — no state
+    // is preserved for runtime, every audio event takes the normal cold-init path.
+    esp_err_t err = this->start_i2s_driver(this->audio_stream_info_);
+    if (err == ESP_OK) {
+      i2s_channel_enable(this->tx_handle_);
+      i2s_channel_disable(this->tx_handle_);
+      this->stop_i2s_driver_();
+      ESP_LOGI(TAG, "I2S boot-settle complete");
+    } else {
+      ESP_LOGW(TAG, "I2S boot-settle skipped: driver init failed");
+    }
+  }
 }
 
 void I2SAudioSpeakerBase::dump_config() {

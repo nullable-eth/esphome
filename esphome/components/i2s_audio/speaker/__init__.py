@@ -43,14 +43,13 @@ I2SAudioSpeaker = i2s_audio_ns.class_("I2SAudioSpeaker", I2SAudioSpeakerBase)
 CONF_DAC_TYPE = "dac_type"
 CONF_I2S_COMM_FMT = "i2s_comm_fmt"
 CONF_SPDIF_MODE = "spdif_mode"
+CONF_KEEP_ALIVE = "keep_alive"
 
 I2SAudioSpeakerBase = i2s_audio_ns.class_(
     "I2SAudioSpeakerBase", cg.Component, speaker.Speaker, I2SAudioOut
 )
 I2SAudioSpeaker = i2s_audio_ns.class_("I2SAudioSpeaker", I2SAudioSpeakerBase)
 I2SAudioSpeakerSPDIF = i2s_audio_ns.class_("I2SAudioSpeakerSPDIF", I2SAudioSpeakerBase)
-
-I2SCommFmt = i2s_audio_ns.enum("I2SCommFmt", is_class=True)
 
 I2SCommFmt = i2s_audio_ns.enum("I2SCommFmt", is_class=True)
 
@@ -161,6 +160,7 @@ BASE_SCHEMA = (
                 cv.positive_time_period_milliseconds,
                 cv.one_of(CONF_NEVER, lower=True),
             ),
+            cv.Optional(CONF_KEEP_ALIVE, default=False): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -250,3 +250,4 @@ async def to_code(config):
     if config[CONF_TIMEOUT] != CONF_NEVER:
         cg.add(var.set_timeout(config[CONF_TIMEOUT]))
     cg.add(var.set_buffer_duration(config[CONF_BUFFER_DURATION]))
+    cg.add(var.set_keep_alive(config[CONF_KEEP_ALIVE]))
