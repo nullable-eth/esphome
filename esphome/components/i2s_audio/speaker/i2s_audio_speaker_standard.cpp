@@ -133,13 +133,11 @@ void I2SAudioSpeaker::run_speaker_task() {
     // - No timeout configured, OR
     // - Timeout hasn't elapsed since last data
     //
-    // Always-fill model: every iteration writes exactly one DMA buffer's worth, mixing real audio
-    // and silence padding as needed. The blocking ``i2s_channel_write`` paces the loop at the DMA
-    // consumption rate, and every buffer write is matched 1:1 with a record on ``write_records_queue_``.
-    //
-    // While paused, the real-audio fill is skipped and the entire DMA buffer is filled with silence;
-    // the same blocking ``i2s_channel_write`` provides natural pacing (one buffer per ~DMA_BUFFER_DURATION_MS),
-    // so the lockstep invariant is preserved without burning CPU.
+    // Event-driven model: the DMA fires one on_sent completion event per buffer, and each iteration
+    // waits for exactly one event before composing and writing one replacement buffer. A write only
+    // happens in response to a completion, so the task cannot outrun the DMA and write_records_queue_
+    // stays at its preloaded depth. The event wait uses a finite timeout so an idle DMA never blocks
+    // the task indefinitely.
     while (this->pause_state_ || !this->timeout_.has_value() ||
            (millis() - last_data_received_time) <= this->timeout_.value()) {
       uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
@@ -162,20 +160,23 @@ void I2SAudioSpeaker::run_speaker_task() {
         break;
       }
 
-      // Drain ISR-stamped completion events. Each event corresponds 1:1 with a write_records_queue_
-      // entry by construction (preloaded records at startup, plus exactly one record pushed per
-      // iteration alongside exactly one DMA-buffer-sized write).
+      // Wait for one completion event before writing, so the task stays paced 1:1 with the DMA. The
+      // finite timeout keeps the task responsive to stop commands when the DMA is idle.
       int64_t write_timestamp;
-      bool lockstep_broken = false;
-      while (xQueueReceive(this->i2s_event_queue_, &write_timestamp, 0)) {
-        uint32_t real_frames = 0;
-        if (xQueueReceive(this->write_records_queue_, &real_frames, 0) != pdTRUE) {
-          // Should never happen: would indicate the lockstep invariant is broken.
-          ESP_LOGV(TAG, "Event without matching write record");
-          xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
-          lockstep_broken = true;
+      if (xQueueReceive(this->i2s_event_queue_, &write_timestamp, WRITE_TIMEOUT_TICKS) != pdTRUE) {
+        // No completion this interval. Check graceful-stop completion, then loop to re-wait.
+        if (stop_gracefully && audio_source->available() == 0 && !this->has_buffered_data() &&
+            pending_real_buffers == 0) {
+          ESP_LOGV(TAG, "Exiting: graceful stop complete");
           break;
         }
+        continue;
+      }
+
+      // Pop the record matching this completion event (preloaded records seed the lockstep; the task
+      // pushes one record per write below).
+      uint32_t real_frames = 0;
+      if (xQueueReceive(this->write_records_queue_, &real_frames, 0) == pdTRUE) {
         if (real_frames > 0) {
           pending_real_buffers--;
           // Real audio is packed at the start of each DMA buffer with any silence padding on the
@@ -186,9 +187,6 @@ void I2SAudioSpeaker::run_speaker_task() {
               write_timestamp - this->current_stream_info_.frames_to_microseconds(silence_frames);
           this->audio_output_callback_(real_frames, adjusted_ts);
         }
-      }
-      if (lockstep_broken) {
-        break;
       }
 
       // Graceful stop: exit only after the source's exposed chunk is drained, the underlying ring

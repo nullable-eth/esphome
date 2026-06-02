@@ -213,6 +213,10 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
 
     xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
 
+    // Event-driven model (mirrors the standard speaker): each iteration waits for one on_sent
+    // completion event before committing one replacement block, so the task stays paced 1:1 with the
+    // DMA and write_records_queue_ stays at its preloaded depth. The wait uses a finite timeout.
+    //
     // SPDIF continuous mode: loop runs indefinitely, outputting silence when no audio data
     // to keep the receiver synced. Exits only via break (stream info change, silence timeout,
     // lockstep desync, dropped event, or partial-write failure).
@@ -244,21 +248,17 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
         break;
       }
 
-      // Drain ISR completion events, popping a matching record for each.
+      // Wait for one completion event before committing the next block, so the task stays paced 1:1
+      // with the DMA. The finite timeout keeps the task responsive when the DMA is idle.
       int64_t write_timestamp;
-      bool lockstep_broken = false;
-      while (xQueueReceive(this->i2s_event_queue_, &write_timestamp, 0)) {
-        // Lockstep: pop the matching record (real audio frames packed into this DMA block).
-        // Records are pushed by the task right after each successful block commit, so the FIFO
-        // order matches DMA completion order. Empty records queue here means lockstep broke.
-        uint32_t real_frames = 0;
-        if (xQueueReceive(this->write_records_queue_, &real_frames, 0) != pdTRUE) {
-          ESP_LOGV(TAG, "Event without matching write record");
-          xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
-          lockstep_broken = true;
-          break;
-        }
+      if (xQueueReceive(this->i2s_event_queue_, &write_timestamp, write_timeout_ticks) != pdTRUE) {
+        continue;
+      }
 
+      // Pop the record matching this completion event (preloaded records seed the lockstep; the task
+      // pushes one record per committed block below).
+      uint32_t real_frames = 0;
+      if (xQueueReceive(this->write_records_queue_, &real_frames, 0) == pdTRUE) {
         // Per-block timestamp adjustment: shift back by the silence-padding portion of the block
         // so the reported timestamp reflects when the last real sample left the wire.
         uint32_t frames_sent = real_frames;
@@ -289,13 +289,8 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
           spdif_dma_event_count = 0;
         }
       }
-      if (lockstep_broken) {
-        ESP_LOGV(TAG, "Exiting: lockstep desync, restarting task");
-        break;
-      }
 
-      // Always-fill: produce exactly one SPDIF block this iteration. The blocking encoder write
-      // paces the task at the DMA consumption rate.
+      // Produce exactly one SPDIF block this iteration, into the descriptor the completion freed.
       uint32_t real_frames_in_block = 0;
       bool block_committed = false;
       bool partial_write_failure = false;
